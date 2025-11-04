@@ -1,7 +1,7 @@
 from collections import defaultdict
 
 import numpy as np
-from transformers import LlamaTokenizerFast, WhisperTokenizer
+from transformers import LlamaTokenizerFast, WhisperTokenizer, RobertaTokenizer
 from transformers.models.llama.tokenization_llama import SPIECE_UNDERLINE
 
 
@@ -84,3 +84,34 @@ class WhisperByteTokenizer(WhisperTokenizer, ByteTokenizer):
     def convert_ids_to_bytes(self, ids, skip_special_tokens=True):
         tokens = self.convert_ids_to_tokens(ids, skip_special_tokens=skip_special_tokens)
         return [bytes([self.byte_decoder[c] for c in s]) for s in tokens]
+
+
+class TrOCRByteTokenizer(RobertaTokenizer, ByteTokenizer):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+
+    def convert_ids_to_bytes(self, ids, skip_special_tokens=True):
+        if isinstance(ids, int):
+            ids = [ids]
+        tokens = self.convert_ids_to_tokens(ids, skip_special_tokens=skip_special_tokens)
+        if isinstance(tokens, str):
+            tokens = [tokens]
+        return [self._convert_token_to_bytes(token) for token in tokens]
+
+    def _convert_token_to_bytes(self, token):
+        if token in self.all_special_tokens:
+            return token.encode("utf8")
+        byte_values = [self.byte_decoder.get(ch, ord(ch)) for ch in token]
+        return bytes(byte_values)
+
+    def tokenize_from_byte(self, byte_str):
+        str_part = byte_str.decode('utf8', errors='ignore')
+        ids = self(str_part, add_special_tokens=False).input_ids
+        encoded_str_part = str_part.encode('utf8')
+        leftover = byte_str[len(encoded_str_part):]
+
+        for byte_val in leftover:
+            token_char = self.byte_encoder[byte_val]
+            ids.append(self.convert_tokens_to_ids(token_char))
+
+        return ids

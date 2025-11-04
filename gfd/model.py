@@ -53,7 +53,8 @@ class KVCache:
         # Update min_length after removal
         self._query_count = Counter()
         self._newly_added = set()
-        torch.cuda.empty_cache()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
         if DEBUG >= 1:
             print(len(self._decode_ids_to_kv))
         if DEBUG >= 2:
@@ -106,12 +107,33 @@ class ByteModel:
 class BreezeByte(ByteModel):
     def __init__(self, config):
         self.config = config
-        self.llm = AutoModelForCausalLM.from_pretrained(
-            self.config.llm_model_path, 
-            device_map=self.config.llm_device,
-            torch_dtype=torch.float16,
-            attn_implementation=self.config.llm_attn_implementation
-        )
+        llm_dtype_name = getattr(self.config, 'llm_torch_dtype', None)
+        if llm_dtype_name is not None:
+            llm_dtype = getattr(torch, llm_dtype_name)
+        else:
+            llm_dtype = torch.float16 if torch.cuda.is_available() else torch.float32
+
+        llm_device = getattr(self.config, 'llm_device', 'cpu')
+        attn_impl = getattr(self.config, 'llm_attn_implementation', None)
+
+        if isinstance(llm_device, str) and llm_device.startswith('cuda') and not torch.cuda.is_available():
+            raise RuntimeError("CUDA device requested but CUDA is not available.")
+
+        model_kwargs = {'torch_dtype': llm_dtype}
+        if attn_impl is not None:
+            model_kwargs['attn_implementation'] = attn_impl
+
+        if llm_device in ('cpu', 'cuda', 'cuda:0', 'cuda:1'):
+            self.llm = AutoModelForCausalLM.from_pretrained(
+                self.config.llm_model_path,
+                **model_kwargs
+            ).to(llm_device)
+        else:
+            self.llm = AutoModelForCausalLM.from_pretrained(
+                self.config.llm_model_path,
+                device_map=llm_device,
+                **model_kwargs
+            )
         self.device = self.llm.device
         self.kv_cache = KVCache()
         self.static_cache = None
@@ -230,4 +252,3 @@ class BreezeByte(ByteModel):
             start_token_id=len(prefix_decoding_ids))
         
         return logprob.item(), normalizer_adjust_n
-

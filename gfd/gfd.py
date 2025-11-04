@@ -1,211 +1,146 @@
-import os
-import time
+from typing import Union
 
-import torch
-import unittest
 import numpy as np
-import librosa
-from transformers import WhisperForConditionalGeneration, WhisperProcessor, GenerationConfig
+import torch
+from PIL import Image
+from transformers import TrOCRProcessor, VisionEncoderDecoderModel
 
 from gfd.beam import BeamsControler
 from gfd.model import BreezeByte
-from gfd.tokenizer import LlamaByteTokenizer, WhisperByteTokenizer
+from gfd.tokenizer import LlamaByteTokenizer, TrOCRByteTokenizer
 
 DEBUG = 1
 
-class SuppressTokenWarper():
-    def __init__(self, surpress_tokens, min_value):
-        self.surpress_tokens = surpress_tokens
-        self.min_value = min_value
-    
-    def __call__(self, scores):
-        scores[...,self.surpress_tokens] = self.min_value
-        return scores
 
 class Breezper:
     def __init__(self, config):
         self.config = config
-        self.asr = WhisperForConditionalGeneration.from_pretrained(
-            self.config.asr_model_path, torch_dtype=torch.float16, device_map=self.config.asr_device, 
-            attn_implementation=self.config.asr_attn_implementation)
-        self.device = self.asr.device
-        self.asr_processor = WhisperProcessor.from_pretrained(self.config.asr_model_path)
-        self.asr_tokenizer = WhisperByteTokenizer.from_pretrained(self.config.asr_model_path)
 
-        self.breeze_byte = BreezeByte(config)
+        self.ocr_processor = TrOCRProcessor.from_pretrained(self.config.ocr_model_path)
+        dtype = self._resolve_dtype(getattr(self.config, "ocr_torch_dtype", None))
+        if dtype is not None:
+            self.ocr_model = VisionEncoderDecoderModel.from_pretrained(
+                self.config.ocr_model_path,
+                torch_dtype=dtype,
+            )
+        else:
+            self.ocr_model = VisionEncoderDecoderModel.from_pretrained(self.config.ocr_model_path)
+
+        self.device = torch.device(self.config.ocr_device)
+        self.ocr_model.to(self.device)
+        self.ocr_model.eval()
+
+        self.ocr_tokenizer = TrOCRByteTokenizer.from_pretrained(self.config.ocr_model_path)
+        self.ocr_model.config.decoder_start_token_id = self.ocr_tokenizer.bos_token_id
+        self.ocr_model.config.pad_token_id = self.ocr_tokenizer.pad_token_id
+        self.ocr_model.config.eos_token_id = self.ocr_tokenizer.eos_token_id
+
         self.llm_tokenizer = LlamaByteTokenizer.from_pretrained(self.config.llm_model_path)
+        self.breeze_byte = BreezeByte(self.config)
 
-        self.asr_prefix_prompt_template = "<|startofprev|> {prompt} "
-        if self.config.lang == 'en':
-            self.asr_prefix_template = "<|startoftranscript|><|en|><|transcribe|><|notimestamps|>"
-            self.asr_default_prompt = None
-        elif self.config.lang == 'zh':
-            self.asr_prefix_template = "<|startoftranscript|><|zh|><|transcribe|><|notimestamps|>"
-            self.asr_default_prompt = '繁體中文'
-
+        self.ocr_prefix_template = "{prompt}"
         self.llm_prefix_template = "<s>{prompt}"
 
-        asr_config = GenerationConfig().from_pretrained(self.config.asr_model_path)
-        self.suppress_tokens = asr_config.suppress_tokens
-        self.begin_suppress_tokens = asr_config.begin_suppress_tokens
-        self.surpress_token_func = SuppressTokenWarper(self.suppress_tokens, min_value=float("-inf"))
-        self.surpress_begin_token_func = SuppressTokenWarper(self.begin_suppress_tokens + self.suppress_tokens, min_value=float("-inf"))
+    def _resolve_dtype(self, dtype_name):
+        if dtype_name is None:
+            return None
+        if isinstance(dtype_name, str):
+            if not hasattr(torch, dtype_name):
+                raise ValueError(f"Unsupported torch dtype: {dtype_name}")
+            return getattr(torch, dtype_name)
+        return dtype_name
 
-    def _chunk_audio(self, y, sr):
-        chunk_size = self.config.chunk_sec * sr
-        stride_size = self.config.stride_sec * sr
-        length = len(y)
-        count = 1 + max(0, int(np.ceil((length - chunk_size) / (chunk_size - stride_size))))
-        for i in range(count):
-            start = i * (chunk_size - stride_size)
-            end = min(start + chunk_size, length)
-            chunked_y = y[start:end]
-            yield chunked_y
+    def _load_image(self, image_input: Union[str, np.ndarray, Image.Image]) -> Image.Image:
+        if isinstance(image_input, Image.Image):
+            return image_input.convert("RGB")
+        if isinstance(image_input, np.ndarray):
+            return Image.fromarray(image_input).convert("RGB")
+        if isinstance(image_input, str):
+            image = Image.open(image_input)
+            return image.convert("RGB")
+        raise TypeError("Unsupported image input type. Provide a path, numpy array, or PIL.Image.")
 
-    def _chunk_audio_by_whipser(self, y, sr, seg_with_overlap):
-        input_features = self.asr_processor(y, sampling_rate=sr, 
-            return_tensors="pt", truncation=False).input_features.half().to(self.device)
-        res = self.asr.generate(prompt_condition_type='first-segment', input_features=input_features, num_beams=5,
-                                return_segments=True, return_dict_in_generate=True)
-
-        intervals = []
-        # Return segments aggregated by target duration 
-        if seg_with_overlap == True: 
-            target_duration = 30
-            sub_intervals = [(chunk['start'].item(), chunk['end'].item()) for chunk in res['segments'][0]]
-            curr_start, curr_end = sub_intervals[0][0], sub_intervals[0][1]
-            last_start = None
-            for next_start, next_end in sub_intervals[1:]:
-                if curr_end - curr_start + (next_end - next_start) > target_duration:
-                    intervals.append((curr_start, curr_end))
-                    curr_start = last_start
-                else:
-                    last_start = next_start
-                curr_end = next_end
-        elif seg_with_overlap == False:
-            last_sequence = None
-            for chunk in res['segments'][0]:
-                curr_sequence = chunk['result']['sequences']
-                if last_sequence is None or not torch.equal(last_sequence, curr_sequence):
-                    intervals.append((chunk['start'].item(), chunk['end'].item()))
-                    last_sequence = curr_sequence
-                else:
-                    old_start, old_end = intervals.pop()
-                    intervals.append((min(old_start, chunk['start'].item()), max(old_end, chunk['end'].item())))
-        else:
-            raise NotImplementedError
-
-        for start, end in intervals:
-            yield y[int(start*sr): int(end*sr)]
-               
-    def get_transcription(self, fpath_or_audio, sr=16000, num_beams=5, asr_prompt='', llm_prompt=''):
-        if isinstance(fpath_or_audio, str):
-            y, sr = librosa.load(fpath_or_audio, sr = sr)
-        else:
-            y = fpath_or_audio
-            sr = sr
+    def get_transcription(self, image_input, num_beams=5, ocr_prompt="", llm_prompt=""):
+        image = self._load_image(image_input)
 
         if DEBUG:
-            print('asr prompt:', asr_prompt)
-            print('llm prompt:', llm_prompt)
+            print("ocr prompt:", ocr_prompt)
+            print("llm prompt:", llm_prompt)
 
-        if len(y) <= sr * 30:
-            transcription = self._get_transcription(y, sr, num_beams, asr_prompt=asr_prompt, llm_prompt=llm_prompt, use_cache=self.config.use_cache)
-        else:
-            transcription = ''
-            for chunked_y in self._chunk_audio_by_whipser(y, sr, seg_with_overlap=self.config.seg_with_overlap):
-                last_transcription = self._get_transcription(chunked_y, sr, num_beams, asr_prompt=asr_prompt, llm_prompt=llm_prompt+transcription[-self.config.transcription_cutoff:], use_cache=self.config.use_cache)
-                transcription += last_transcription + ' '
-                asr_prompt = last_transcription
+        pixel_values = self.ocr_processor(image, return_tensors="pt").pixel_values.to(self.device)
+        encoder_outputs = self.ocr_model.get_encoder()(pixel_values, return_dict=True)
 
-                if DEBUG:
-                    print('current transcription:', transcription)
-                    time.sleep(3)
-                    if DEBUG > 2:
-                        input("Enter to continue ...")
-
+        transcription = self._decode_with_fusion(
+            encoder_outputs=encoder_outputs,
+            num_beams=num_beams,
+            ocr_prompt=ocr_prompt,
+            llm_prompt=llm_prompt,
+            use_cache=getattr(self.config, "use_cache", None),
+        )
         return transcription
 
-    def fuse(self, asr_score, llm_score):
-        if self.config.fuse_strategy == 'simple':  
-            return (1 - self.config.fusing_r) * asr_score + self.config.fusing_r * llm_score 
-        else:
-            raise NotImplementedError()
+    def fuse(self, recognizer_score, llm_score):
+        if self.config.fuse_strategy == "simple":
+            return (1 - self.config.fusing_r) * recognizer_score + self.config.fusing_r * llm_score
+        raise NotImplementedError()
 
-    def _get_prefix_decoding_ids(self, asr_prompt, llm_prompt):
-        # asr
-        asr_prompt = asr_prompt if asr_prompt else self.asr_default_prompt
-        asr_prefix = (
-            self.asr_prefix_prompt_template.format(prompt=asr_prompt)
-            + self.asr_prefix_template
-        )
-        asr_prefix_decoding_ids = self.asr_tokenizer(
-            asr_prefix,
-            add_special_tokens=False
-        ).input_ids
+    def _get_prefix_decoding_ids(self, ocr_prompt, llm_prompt):
+        ocr_ids = [self.ocr_tokenizer.bos_token_id]
+        prompt = (ocr_prompt or "").strip()
+        if prompt:
+            ocr_ids.extend(self.ocr_tokenizer(prompt, add_special_tokens=False).input_ids)
 
-        # llm
         llm_prefix_decoding_ids = self.llm_tokenizer.tokenize_from_byte(
-            self.llm_prefix_template.format(
-                prompt=llm_prompt
-            ).encode('utf8')
+            self.llm_prefix_template.format(prompt=llm_prompt).encode("utf8")
         )
 
-        return asr_prefix_decoding_ids, llm_prefix_decoding_ids
+        return ocr_ids, llm_prefix_decoding_ids
 
-    def _asr_forward(self, encoder_outputs, decoder_input_ids, k, supress_func=None):
+    def _ocr_forward(self, encoder_outputs, decoder_input_ids, k):
         with torch.no_grad():
-            logits = self.asr(
+            decoder_tensor = torch.tensor([decoder_input_ids], device=self.device)
+            logits = self.ocr_model(
                 encoder_outputs=encoder_outputs,
-                decoder_input_ids=torch.tensor(decoder_input_ids, device=self.device), 
-                return_dict=True
+                decoder_input_ids=decoder_tensor,
+                return_dict=True,
             ).logits
-            if supress_func is not None:
-                logits = supress_func(logits)
-            logprobs = torch.log(torch.softmax(logits, dim=-1))
+            logprobs = torch.log_softmax(logits, dim=-1)
             next_logprobs, inds = torch.topk(logprobs[0, -1, :], k, dim=-1)
 
         return next_logprobs, inds
 
-    def _get_transcription(self, y, sr, num_beams, asr_prompt, llm_prompt, use_cache=None):
-        input_features = self.asr_processor(y, sampling_rate=sr, 
-            return_tensors="pt").input_features.half().to(self.device)
-        encoder_outputs = self.asr.get_encoder()(input_features, return_dict=True)
-
+    def _decode_with_fusion(self, encoder_outputs, num_beams, ocr_prompt, llm_prompt, use_cache=None):
         beams = BeamsControler(
             config=self.config,
             n_beam=num_beams,
-            asr_eos_id=self.asr_tokenizer.eos_token_id)
-        
-        asr_prefix_decoding_ids, llm_prefix_decoding_ids = self._get_prefix_decoding_ids(asr_prompt, llm_prompt)
-        next_asr_logprobs, asr_inds = self._asr_forward(
-            encoder_outputs,
-            asr_prefix_decoding_ids,
-            k=1,
-            supress_func=self.surpress_begin_token_func
+            asr_eos_id=self.ocr_tokenizer.eos_token_id,
         )
-        for ind, next_asr_logprob in zip(asr_inds, next_asr_logprobs):
-            next_id = ind.item()
-            next_asr_logprob = next_asr_logprob.item()
-            asr_score, llm_score = self._calcualte_asr_llm_score(
-                asr_normalized_len=1,
-                asr_logprob=next_asr_logprob,
-                llm_normalized_len=1,
-                llm_logprob=None
-            )
 
-            fuse_score = self.fuse(asr_score, llm_score)
+        ocr_prefix_ids, llm_prefix_ids = self._get_prefix_decoding_ids(ocr_prompt, llm_prompt)
+        next_scores, next_tokens = self._ocr_forward(encoder_outputs, ocr_prefix_ids, k=1)
+
+        for token_id, token_score in zip(next_tokens, next_scores):
+            next_id = token_id.item()
+            score = token_score.item()
+            recognizer_score, llm_score = self._calcualte_asr_llm_score(
+                asr_normalized_len=1,
+                asr_logprob=score,
+                llm_normalized_len=1,
+                llm_logprob=None,
+            )
+            fuse_score = self.fuse(recognizer_score, llm_score)
             beams.add(
-                asr_score=asr_score,
+                asr_score=recognizer_score,
                 llm_score=llm_score,
                 fuse_score=fuse_score,
-                asr_prefix_ids=asr_prefix_decoding_ids,
+                asr_prefix_ids=ocr_prefix_ids,
                 asr_ids=[next_id],
-                asr_logprob=next_asr_logprob,
-                llm_prefix_ids=llm_prefix_decoding_ids,
+                asr_logprob=score,
+                llm_prefix_ids=llm_prefix_ids,
                 llm_ids=[],
                 llm_logprob=None,
             )
+
         self._update_asr_llm_mean_and_std(beams._next_beams)
         beams.update()
 
@@ -213,96 +148,98 @@ class Breezper:
             for beam in beams.list():
                 if beam.reach_end:
                     beams.add_beam(beam)
+                    continue
+
+                next_scores, next_tokens = self._ocr_forward(
+                    encoder_outputs,
+                    beam.asr_prefix_ids + beam.asr_ids,
+                    k=num_beams,
+                )
+
+                next_tokens = [token.item() for token in next_tokens]
+                next_scores = [score.item() for score in next_scores]
+
+                if next_tokens and next_tokens[0] == self.ocr_tokenizer.eos_token_id:
+                    next_tokens = next_tokens[:1]
+                    next_scores = next_scores[:1]
+                elif self.ocr_tokenizer.eos_token_id in next_tokens:
+                    eos_idx = next_tokens.index(self.ocr_tokenizer.eos_token_id)
+                    next_tokens = next_tokens[:eos_idx] + next_tokens[eos_idx + 1 :]
+                    next_scores = next_scores[:eos_idx] + next_scores[eos_idx + 1 :]
+
+                recognizer_bytes = self.ocr_tokenizer.convert_ids_to_bytes(
+                    beam.asr_ids,
+                    skip_special_tokens=True,
+                )
+                new_content = b"".join(recognizer_bytes)
+                llm_ids = self.llm_tokenizer.tokenize_from_byte(new_content)
+
+                if use_cache == "dynamic":
+                    llm_logprob, normalizer_adjust_n = self.breeze_byte.get_logprob_cache_dynamic(
+                        prefix_decoding_ids=llm_prefix_ids,
+                        llm_ids=llm_ids,
+                        llm_tokenizer=self.llm_tokenizer,
+                    )
+                elif use_cache == "static":
+                    llm_logprob, normalizer_adjust_n = self.breeze_byte.get_logprob_cache_static(
+                        prefix_decoding_ids=llm_prefix_ids,
+                        llm_ids=llm_ids,
+                        llm_tokenizer=self.llm_tokenizer,
+                    )
                 else:
-                    next_asr_logprobs, asr_inds = self._asr_forward(
-                        encoder_outputs,
-                        beam.asr_prefix_ids + beam.asr_ids,
-                        k=num_beams,
-                        supress_func=self.surpress_token_func
+                    llm_logprob, normalizer_adjust_n = self.breeze_byte.get_logprob(
+                        prefix_decoding_ids=llm_prefix_ids,
+                        llm_ids=llm_ids,
+                        llm_tokenizer=self.llm_tokenizer,
                     )
 
-                    asr_inds = [x.item() for x in asr_inds]
-                    next_asr_logprobs = [x.item() for x in next_asr_logprobs]
+                assert normalizer_adjust_n <= 0
 
-                    # important: check if asr respond "stop" at top
-                    # if not, go back normal operation
-                    if asr_inds[0] == self.asr_tokenizer.eos_token_id:
-                        next_asr_logprobs = next_asr_logprobs[0:1]
-                        asr_inds = asr_inds[0:1]
-
-                    # drop "ending at not top"
-                    elif self.asr_tokenizer.eos_token_id in asr_inds:
-                        p = asr_inds.index(self.asr_tokenizer.eos_token_id)
-                        next_asr_logprobs = next_asr_logprobs[:p] + next_asr_logprobs[p+1:]
-                        asr_inds = asr_inds[:p] + asr_inds[p+1:]
-                    
-
-                    asr_new_content = self.asr_tokenizer.convert_ids_to_bytes(
-                        beam.asr_ids, skip_special_tokens=True
+                for next_id, score in zip(next_tokens, next_scores):
+                    recognizer_logprob = score + beam.asr_logprob
+                    recognizer_score, llm_score = self._calcualte_asr_llm_score(
+                        asr_normalized_len=len(beam.asr_ids) + 1,
+                        asr_logprob=recognizer_logprob,
+                        llm_normalized_len=len(llm_ids) + normalizer_adjust_n,
+                        llm_logprob=llm_logprob,
                     )
-                    new_content = b''.join(asr_new_content)
+                    fuse_score = self.fuse(recognizer_score, llm_score)
+                    beams.add(
+                        asr_score=recognizer_score,
+                        llm_score=llm_score,
+                        fuse_score=fuse_score,
+                        asr_prefix_ids=beam.asr_prefix_ids,
+                        asr_ids=beam.asr_ids + [next_id],
+                        asr_logprob=recognizer_logprob,
+                        llm_prefix_ids=beam.llm_prefix_ids,
+                        llm_ids=llm_ids,
+                        llm_logprob=llm_logprob,
+                    )
 
-                    llm_ids = self.llm_tokenizer.tokenize_from_byte(new_content)
-                    if use_cache == 'dynamic':
-                        llm_logprob, normalizer_adjust_n = self.breeze_byte.get_logprob_cache_dynamic(
-                            prefix_decoding_ids=llm_prefix_decoding_ids,
-                            llm_ids=llm_ids,
-                            llm_tokenizer=self.llm_tokenizer
-                        )
-                    elif use_cache == 'static':
-                        llm_logprob, normalizer_adjust_n = self.breeze_byte.get_logprob_cache_static(
-                            prefix_decoding_ids=llm_prefix_decoding_ids,
-                            llm_ids=llm_ids,
-                            llm_tokenizer=self.llm_tokenizer
-                        )
-                    else:
-                        llm_logprob, normalizer_adjust_n = self.breeze_byte.get_logprob(
-                            prefix_decoding_ids=llm_prefix_decoding_ids,
-                            llm_ids=llm_ids,
-                            llm_tokenizer=self.llm_tokenizer
-                        )
-                        
-                    assert normalizer_adjust_n <= 0
-                    
-                    for next_id, next_asr_logprob in zip(asr_inds, next_asr_logprobs):
-                        asr_logprob = next_asr_logprob + beam.asr_logprob
-                        asr_score, llm_score = self._calcualte_asr_llm_score(
-                            asr_normalized_len=len(beam.asr_ids)+1,
-                            asr_logprob=asr_logprob,
-                            llm_normalized_len=len(llm_ids) + normalizer_adjust_n,
-                            llm_logprob=llm_logprob
-                        )
-                        fuse_score = self.fuse(asr_score, llm_score)
-                        beams.add(
-                            asr_score=asr_score,
-                            llm_score=llm_score,
-                            fuse_score=fuse_score,
-                            asr_prefix_ids=beam.asr_prefix_ids,
-                            asr_ids=beam.asr_ids + [next_id],
-                            asr_logprob=asr_logprob,
-                            llm_prefix_ids=beam.llm_prefix_ids,
-                            llm_ids=llm_ids,
-                            llm_logprob=llm_logprob,
-                        )
             self._update_asr_llm_mean_and_std(beams._next_beams)
             beams.update()
             self.breeze_byte.kv_cache.remove_unused()
 
             if DEBUG > 1:
-                for k, beam in enumerate(beams.list()):
-                    print(f'''[{k}] asr_score={beam.asr_score}, llm_score={beam.llm_score},fuse_score={beam.fuse_score},
-{self.asr_tokenizer.decode(beam.asr_ids)}''')
+                for idx, beam in enumerate(beams.list()):
+                    print(
+                        f"[{idx}] recognizer_score={beam.asr_score}, "
+                        f"llm_score={beam.llm_score}, fuse_score={beam.fuse_score},\n"
+                        f"{self.ocr_tokenizer.decode(beam.asr_ids)}"
+                    )
                 print()
-            elif DEBUG > 0:
+            elif DEBUG > 0 and beams.list():
                 beam = beams.list()[0]
-                print(f'''[0] asr_score={beam.asr_score}, llm_score={beam.llm_score},fuse_score={beam.fuse_score},
-{self.asr_tokenizer.decode(beam.asr_ids)}
-''')
+                print(
+                    f"[0] recognizer_score={beam.asr_score}, "
+                    f"llm_score={beam.llm_score}, fuse_score={beam.fuse_score},\n"
+                    f"{self.ocr_tokenizer.decode(beam.asr_ids)}\n"
+                )
 
             if beams.is_terminated():
                 break
 
-        transcription = beams.get_result(self.asr_tokenizer)
+        transcription = beams.get_result(self.ocr_tokenizer)
         return transcription
 
     def _update_asr_llm_mean_and_std(self, beams_list):
@@ -312,9 +249,10 @@ class Breezper:
     def _calcualte_asr_llm_score(self, asr_normalized_len, asr_logprob, llm_normalized_len, llm_logprob):
         if not (asr_logprob > self.config.logprob_min):
             asr_logprob = self.config.logprob_min
-            
-        if llm_logprob is None or  not (llm_logprob > self.config.logprob_min):
+
+        if llm_logprob is None or not (llm_logprob > self.config.logprob_min):
             llm_logprob = self.config.logprob_min
+
         asr_score = asr_logprob / asr_normalized_len if asr_normalized_len > 0 else self.config.logprob_min
         llm_score = llm_logprob / llm_normalized_len if llm_normalized_len > 0 else self.config.logprob_min
 
