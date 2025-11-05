@@ -163,3 +163,6 @@ cython_debug/
 
 # Test output directory
 test_output/
+
+# 訓練模型檔案（太大，需另外下載）
+models/
