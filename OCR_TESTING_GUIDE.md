@@ -17,30 +17,49 @@
 
 ### 1. 啟動虛擬環境
 
-本專案使用虛擬環境，確保先啟動：
+本專案支援兩種虛擬環境管理方式：
+
+#### 方法 A: 使用 venv（已有環境）
 
 ```bash
 source .venv/bin/activate
 ```
 
-或使用 conda：
+#### 方法 B: 使用 Conda（推薦）
 
 ```bash
-conda activate your_env_name
+# 創建 conda 環境（首次）
+conda create -n gfd-ocr python=3.9 -y
+
+# 啟動環境
+conda activate gfd-ocr
+
+# 安裝依賴（首次）
+conda install pytorch==2.2.1 cpuonly -c pytorch -y
+pip install transformers==4.40.1 pillow pyyaml
+python setup.py install
 ```
+
+**詳細的 Conda 設定步驟請參考**: [CONDA_SETUP_GUIDE.md](CONDA_SETUP_GUIDE.md)
 
 ### 2. 檢查依賴套件
 
-確認已安裝必要套件：
+#### 使用 pip 檢查
 
 ```bash
 pip list | grep -E "(torch|transformers|Pillow)"
 ```
 
-應該看到：
+#### 使用 conda 檢查
+
+```bash
+conda list | grep -E "(torch|transformers|pillow)"
+```
+
+**應該看到**：
 - `torch` (2.2.1 或更高)
 - `transformers` (4.40.1 或更高)
-- `Pillow` (10.3.0 或更高)
+- `Pillow` 或 `pillow` (10.x 或更高)
 
 ---
 
@@ -130,7 +149,9 @@ PYTHONPATH=. python test_ocr_evaluation.py
 
 **注意**: 此測試會載入兩個模型（with/without fusion），需要較多時間和記憶體。
 
-**輸出檔案**: `/tmp/ocr_evaluation_results.json`
+**輸出位置**:
+- 測試圖片：`./test_output/images/evaluation/`
+- 評估結果：`./test_output/results/ocr_evaluation_results.json`
 
 ---
 
@@ -164,10 +185,15 @@ export PYTHONPATH=.
 python test_ocr_evaluation.py
 
 # 3. 查看結果
-cat /tmp/ocr_evaluation_results.json
+cat test_output/results/ocr_evaluation_results.json
+
+# 4. 查看測試圖片
+ls -lh test_output/images/evaluation/
 ```
 
 預期 15-30 分鐘完成（視 CPU 速度而定）。
+
+**測試輸出位置**：`./test_output/`
 
 ---
 

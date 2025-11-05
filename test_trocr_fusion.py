@@ -4,12 +4,17 @@
 """
 
 import sys
+import os
 import torch
 from PIL import Image, ImageDraw, ImageFont
 from types import SimpleNamespace
 
 from gfd.gfd import Breezper
 from gfd.utils import process_config, combine_config
+
+# 設定輸出目錄
+OUTPUT_DIR = os.path.join(os.path.dirname(__file__), "test_output", "images", "fusion")
+os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 def create_test_image(text="HELLO WORLD", size=(400, 100), font_size=40):
     """創建測試圖片"""
@@ -71,7 +76,7 @@ def test_fusion_with_config_files():
 
         # 創建圖片
         img = create_test_image(text, size=size)
-        img_path = f"/tmp/test_fusion_{i}.png"
+        img_path = os.path.join(OUTPUT_DIR, f"test_fusion_{i}.png")
         img.save(img_path)
         print(f"圖片已保存: {img_path}")
 
@@ -141,7 +146,9 @@ def test_fusion_with_simple_config():
     text = "QUICK TEST"
     print(f"\n測試文字: '{text}'")
     img = create_test_image(text)
-    img.save("/tmp/test_quick.png")
+    quick_img_path = os.path.join(OUTPUT_DIR, "test_quick.png")
+    img.save(quick_img_path)
+    print(f"圖片已保存: {quick_img_path}")
 
     result = model.get_transcription(img, num_beams=2)
     print(f"識別結果: '{result}'")

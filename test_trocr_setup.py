@@ -4,10 +4,15 @@
 """
 
 import sys
+import os
 import torch
 from PIL import Image, ImageDraw, ImageFont
 from transformers import TrOCRProcessor, VisionEncoderDecoderModel
 from gfd.tokenizer import TrOCRByteTokenizer
+
+# 設定輸出目錄
+OUTPUT_DIR = os.path.join(os.path.dirname(__file__), "test_output", "images", "setup")
+os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 def create_test_image(text="HELLO WORLD", size=(400, 100), font_size=40):
     """創建測試圖片"""
@@ -121,7 +126,7 @@ def test_trocr_inference(processor, model, tokenizer):
         img = create_test_image(text)
 
         # 保存圖片
-        img_path = f"/tmp/test_image_{i}.png"
+        img_path = os.path.join(OUTPUT_DIR, f"test_image_{i}.png")
         img.save(img_path)
         print(f"  圖片已保存: {img_path}")
 

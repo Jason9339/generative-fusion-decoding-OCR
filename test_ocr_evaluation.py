@@ -11,6 +11,7 @@ OCR 測試效果評估腳本
 """
 
 import sys
+import os
 import time
 import json
 from typing import List, Dict
@@ -19,6 +20,12 @@ import numpy as np
 
 from gfd.gfd import Breezper
 from gfd.utils import process_config, combine_config
+
+# 設定輸出目錄
+OUTPUT_DIR = os.path.join(os.path.dirname(__file__), "test_output", "images", "evaluation")
+RESULTS_DIR = os.path.join(os.path.dirname(__file__), "test_output", "results")
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+os.makedirs(RESULTS_DIR, exist_ok=True)
 
 def create_test_image(text, size=(400, 100), font_size=40,
                      bg_color="white", text_color="black",
@@ -70,13 +77,15 @@ class OCRTester:
         self.with_fusion = with_fusion
 
         # 載入配置
-        model_config = process_config('config_files/model/gfd-ocr-en.yaml')
-        prompt_config = process_config('config_files/prompt/ocr-default-prompt.yaml')
-
-        # 如果不使用 fusion，設定 fusing_r = 0
+        # 如果不使用 fusion，透過 args 覆蓋 fusing_r
+        import argparse
         if not with_fusion:
-            model_config.fusing_r = 0.0
+            override_args = argparse.Namespace(fusing_r=0.0)
+            model_config = process_config('config_files/model/gfd-ocr-en.yaml', args=override_args)
+        else:
+            model_config = process_config('config_files/model/gfd-ocr-en.yaml')
 
+        prompt_config = process_config('config_files/prompt/ocr-default-prompt.yaml')
         self.config = combine_config(prompt_config, model_config)
 
         # 載入模型
@@ -123,7 +132,7 @@ def test_basic_recognition():
     for i, text in enumerate(test_cases, 1):
         print(f"\n測試 {i}/{len(test_cases)}: '{text}'")
         img = create_test_image(text, size=(500, 120))
-        img.save(f"/tmp/test_basic_{i}.png")
+        img.save(os.path.join(OUTPUT_DIR, f"test_basic_{i}.png"))
 
         result = tester.test_image(img, description=f"基礎識別: {text}")
         match = result['result'].upper().strip() == text.upper().strip()
@@ -156,7 +165,7 @@ def test_font_sizes():
     for i, font_size in enumerate(font_sizes, 1):
         print(f"\n測試 {i}/{len(font_sizes)}: 字體大小 {font_size}")
         img = create_test_image(test_text, size=(450, 100), font_size=font_size)
-        img.save(f"/tmp/test_fontsize_{font_size}.png")
+        img.save(os.path.join(OUTPUT_DIR, f"test_fontsize_{font_size}.png"))
 
         result = tester.test_image(img, description=f"字體大小 {font_size}")
         match = result['result'].upper().strip() == test_text.upper().strip()
@@ -191,7 +200,7 @@ def test_with_noise():
         print(f"\n測試 {i}/{len(noise_levels)}: 噪音等級 {noise_level}")
         img = create_test_image(test_text, size=(400, 100),
                                add_noise=True, noise_level=noise_level)
-        img.save(f"/tmp/test_noise_{int(noise_level*100)}.png")
+        img.save(os.path.join(OUTPUT_DIR, f"test_noise_{int(noise_level*100)}.png"))
 
         result = tester.test_image(img, description=f"噪音等級 {noise_level}")
         match = result['result'].upper().strip() == test_text.upper().strip()
@@ -231,7 +240,7 @@ def test_fusion_comparison():
     for i, text in enumerate(test_cases, 1):
         print(f"\n測試 {i}/{len(test_cases)}: '{text}'")
         img = create_test_image(text, size=(500, 120))
-        img.save(f"/tmp/test_comparison_{i}.png")
+        img.save(os.path.join(OUTPUT_DIR, f"test_comparison_{i}.png"))
 
         # 使用 fusion
         result_with = tester_with.test_image(img, description=f"With Fusion: {text}")
@@ -312,8 +321,10 @@ def print_summary(all_results):
         print(f"  With Fusion 平均耗時: {with_time:.2f}s")
         print(f"  Without Fusion 平均耗時: {without_time:.2f}s")
 
-def save_results(results, output_path="/tmp/ocr_evaluation_results.json"):
+def save_results(results, output_path=None):
     """保存結果到 JSON 檔案"""
+    if output_path is None:
+        output_path = os.path.join(RESULTS_DIR, "ocr_evaluation_results.json")
     with open(output_path, 'w', encoding='utf-8') as f:
         json.dump(results, f, indent=2, ensure_ascii=False)
     print(f"\n✓ 結果已保存到: {output_path}")
