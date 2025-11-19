@@ -121,8 +121,12 @@ class ChineseOCRBreezper:
         # 圖像預處理 - 使用訓練時相同的預處理
         try:
             # 嘗試使用訓練時的 OCRImageTransform
+            # 從 repo 根目錄導入（支援獨立執行）
             import sys
-            sys.path.insert(0, '/mnt/whliao/experiment')
+            import os
+            repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+            if repo_root not in sys.path:
+                sys.path.insert(0, repo_root)
             from image_preprocessing import OCRImageTransform
 
             transform = OCRImageTransform(
